@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand/v2"
+	"sort"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus/pkg/v2/common"
@@ -76,16 +77,72 @@ func (ddlt *collDDLTask) createIndexes(ctx context.Context) error {
 	return nil
 }
 
+// resolveIndexField returns the field the index belongs to. Backups taken
+// without --backup_index_extra carry only the field name (field_id, type
+// params and index params come from etcd and are absent), so fall back to the
+// collection schema instead of broadcasting FieldID 0, which would attach the
+// index to a nonexistent field and leave the import job stuck in IndexBuilding.
+func (ddlt *collDDLTask) resolveIndexField(index *backuppb.IndexInfo) (*backuppb.FieldSchema, error) {
+	for _, field := range ddlt.collBackup.GetSchema().GetFields() {
+		if index.GetFieldId() != 0 && field.GetFieldID() == index.GetFieldId() {
+			return field, nil
+		}
+		if index.GetFieldId() == 0 && field.GetName() == index.GetFieldName() {
+			return field, nil
+		}
+	}
+	return nil, fmt.Errorf("collection: index %s refers to unknown field (id=%d name=%s)",
+		index.GetIndexName(), index.GetFieldId(), index.GetFieldName())
+}
+
+// indexParamsOf returns the index params to broadcast. Prefer the etcd copy
+// (IndexParams); otherwise rebuild them from the DescribeIndex params map,
+// which already carries index_type / metric_type and the index-specific keys.
+func indexParamsOf(index *backuppb.IndexInfo) []*commonpb.KeyValuePair {
+	if len(index.GetIndexParams()) != 0 {
+		return pbconv.BakKVToMilvusKV(index.GetIndexParams())
+	}
+	keys := lo.Keys(index.GetParams())
+	sort.Strings(keys)
+	kvs := make([]*commonpb.KeyValuePair, 0, len(keys))
+	for _, k := range keys {
+		kvs = append(kvs, &commonpb.KeyValuePair{Key: k, Value: index.GetParams()[k]})
+	}
+	return kvs
+}
+
 func (ddlt *collDDLTask) createIndex(ctx context.Context, index *backuppb.IndexInfo) error {
+	field, err := ddlt.resolveIndexField(index)
+	if err != nil {
+		return err
+	}
+	typeParams := pbconv.BakKVToMilvusKV(index.GetTypeParams())
+	if len(typeParams) == 0 {
+		typeParams = pbconv.BakKVToMilvusKV(field.GetTypeParams())
+	}
+	if index.GetFieldId() == 0 {
+		ddlt.logger.Info("index info has no field id (backup taken without --backup_index_extra), resolved from schema",
+			zap.String("index_name", index.GetIndexName()), zap.String("field_name", field.GetName()),
+			zap.Int64("field_id", field.GetFieldID()))
+	}
+
+	indexParams := indexParamsOf(index)
+	userIndexParams := pbconv.BakKVToMilvusKV(index.GetUserIndexParams())
+	if len(userIndexParams) == 0 {
+		// DescribeIndex reports the user-facing params from user_index_params;
+		// without them the target shows the index as AUTOINDEX.
+		userIndexParams = indexParams
+	}
+
 	indexInfo := &indexpb.IndexInfo{
 		CollectionID:    ddlt.collBackup.GetCollectionId(),
-		FieldID:         index.GetFieldId(),
+		FieldID:         field.GetFieldID(),
 		IndexName:       index.GetIndexName(),
 		IndexID:         index.GetIndexId(),
-		TypeParams:      pbconv.BakKVToMilvusKV(index.GetTypeParams()),
-		IndexParams:     pbconv.BakKVToMilvusKV(index.GetIndexParams()),
+		TypeParams:      typeParams,
+		IndexParams:     indexParams,
 		IsAutoIndex:     index.GetIsAutoIndex(),
-		UserIndexParams: pbconv.BakKVToMilvusKV(index.GetUserIndexParams()),
+		UserIndexParams: userIndexParams,
 		MinIndexVersion: index.GetMinIndexVersion(),
 		MaxIndexVersion: index.GetMaxIndexVersion(),
 	}
@@ -94,7 +151,7 @@ func (ddlt *collDDLTask) createIndex(ctx context.Context, index *backuppb.IndexI
 	header := &message.CreateIndexMessageHeader{
 		DbId:         ddlt.dbBackup.GetDbId(),
 		CollectionId: ddlt.collBackup.GetCollectionId(),
-		FieldId:      index.GetFieldId(),
+		FieldId:      field.GetFieldID(),
 		IndexId:      index.GetIndexId(),
 		IndexName:    index.GetIndexName(),
 	}
@@ -106,7 +163,7 @@ func (ddlt *collDDLTask) createIndex(ctx context.Context, index *backuppb.IndexI
 		WithBody(body).
 		WithBroadcast([]string{ddlt.backupInfo.GetControlChannelName()})
 
-	err := ddlt.streamCli.Send(ctx, func(uint64) []message.MutableMessage {
+	err = ddlt.streamCli.Send(ctx, func(uint64) []message.MutableMessage {
 		broadcast := builder.MustBuildBroadcast().WithBroadcastID(rand.Uint64())
 		return broadcast.SplitIntoMutableMessage()
 	})

@@ -11,6 +11,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/zilliztech/milvus-backup/core/restore/conv"
@@ -36,6 +37,12 @@ type TaskArgs struct {
 
 	BackupDir     string
 	BackupStorage storage.Client
+
+	// MilvusStorage is the target cluster's own object storage. When it is not
+	// the same bucket/backend as BackupStorage, binlogs are staged into it
+	// before the import message is broadcast, because DataCoord lists import
+	// paths only from its own storage.
+	MilvusStorage storage.Client
 
 	TaskMgr *taskmgr.Mgr
 }
@@ -180,6 +187,10 @@ func (t *Task) dmlTaskArgs() (dmlTaskArgs, error) {
 
 		BackupStorage: t.args.BackupStorage,
 		BackupDir:     t.args.BackupDir,
+
+		MilvusStorage: t.args.MilvusStorage,
+		CrossStorage:  t.args.Params.Minio.CrossStorage.Val,
+		CopySem:       semaphore.NewWeighted(int64(t.args.Params.Backup.Parallelism.CopyData.Val)),
 
 		StreamCli:  t.streamCli,
 		RestfulCli: t.restful,
