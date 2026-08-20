@@ -34,6 +34,11 @@ const (
 	_bulkInsertTimeout             = 60 * time.Minute
 	_bulkInsertRestfulAPIChunkSize = 256
 	_bulkInsertCheckInterval       = 3 * time.Second
+	// How long an import job may stay unknown to the target before the restore
+	// gives up on it. The job id travels inside the import message, so the
+	// target only knows the job once that message has been applied; the window
+	// covers the message still being in flight.
+	_bulkInsertUnknownJobTimeout = 1 * time.Minute
 )
 
 type partitionDir struct {
@@ -291,6 +296,9 @@ func (dmlt *collDMLTask) checkBulkInsertJobs(ctx context.Context, jobIDs []int64
 func (dmlt *collDMLTask) checkBulkInsertJob(ctx context.Context, jobID string) error {
 	// wait for bulk insert job done
 	var lastProgress int
+	// Stays zero until the target reports an empty state, so the window only
+	// starts once there is something to wait out.
+	var unknownSince time.Time
 	lastUpdateTime := time.Now()
 	for range time.Tick(_bulkInsertCheckInterval) {
 		resp, err := dmlt.restfulCli.GetBulkInsertState(ctx, dmlt.collBackup.GetDbName(), jobID)
@@ -308,6 +316,29 @@ func (dmlt *collDMLTask) checkBulkInsertJob(ctx context.Context, jobID string) e
 			dmlt.logger.Info("bulk insert task success", zap.String("job_id", jobID))
 			return nil
 		default:
+			// An empty state is not a state the job can be in: the target does
+			// not have this job at all. That never turns into anything else, so
+			// waiting for it is waiting forever.
+			if resp.Data.State == "" {
+				if unknownSince.IsZero() {
+					unknownSince = time.Now()
+				} else if time.Since(unknownSince) >= _bulkInsertUnknownJobTimeout {
+					return fmt.Errorf("secondary: the target does not know import job %s after %s, "+
+						"so the import message this restore sent was never applied. The usual reason "+
+						"is that the target is not a freshly configured secondary: a secondary only "+
+						"moves its replicate checkpoint forward, and the messages a restore injects "+
+						"are time-ticked from 1, so everything this restore sends is discarded as too "+
+						"old once an earlier restore has advanced that checkpoint. Reset the target "+
+						"before restoring again: force-promote it to a standalone primary, which is "+
+						"the only transition that drops the checkpoint (re-applying the same "+
+						"replicate configuration does not, and neither does restarting it), drop "+
+						"whatever an earlier restore left behind, then configure it as a secondary "+
+						"again", jobID, _bulkInsertUnknownJobTimeout)
+				}
+			} else {
+				unknownSince = time.Time{}
+			}
+
 			currentProgress := resp.Data.Progress
 			if currentProgress > lastProgress {
 				lastProgress = currentProgress
