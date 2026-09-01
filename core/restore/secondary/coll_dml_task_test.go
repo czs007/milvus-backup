@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message"
@@ -88,6 +89,54 @@ func (r *completedRestful) GetBulkInsertState(context.Context, string, string) (
 }
 
 func (r *completedRestful) GetSegmentInfo(context.Context, string, int64, int64) (*milvus.SegmentInfo, error) {
+	return nil, nil
+}
+
+// countingRestful reports Completed at once and calls onCall when a job's wait
+// first asks about it.
+type countingRestful struct {
+	onCall func()
+}
+
+func (r *countingRestful) BulkInsert(context.Context, milvus.BulkInsertV2Input) (string, error) {
+	return "", nil
+}
+
+func (r *countingRestful) GetBulkInsertState(context.Context, string, string) (*milvus.GetProcessResp, error) {
+	if r.onCall != nil {
+		r.onCall()
+	}
+	resp := &milvus.GetProcessResp{}
+	resp.Data.State = string(milvus.ImportStateCompleted)
+	return resp, nil
+}
+
+func (r *countingRestful) GetSegmentInfo(context.Context, string, int64, int64) (*milvus.SegmentInfo, error) {
+	return nil, nil
+}
+
+type sequencedRestful struct {
+	mu     sync.Mutex
+	states []milvus.ImportState
+	calls  int
+}
+
+func (r *sequencedRestful) BulkInsert(context.Context, milvus.BulkInsertV2Input) (string, error) {
+	return "", nil
+}
+
+func (r *sequencedRestful) GetBulkInsertState(context.Context, string, string) (*milvus.GetProcessResp, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	stateIndex := min(r.calls, len(r.states)-1)
+	r.calls++
+	resp := &milvus.GetProcessResp{}
+	resp.Data.State = string(r.states[stateIndex])
+	return resp, nil
+}
+
+func (r *sequencedRestful) GetSegmentInfo(context.Context, string, int64, int64) (*milvus.SegmentInfo, error) {
 	return nil, nil
 }
 
@@ -386,10 +435,52 @@ func TestSendBatches(t *testing.T) {
 		{timestamp: 200, partitionDirs: []partitionDir{{insertLogDir: "/b"}}, storageVersion: 2},
 	}
 
-	jobIDs, err := task.sendBatches(context.Background(), 1, batches)
+	g, ctx := errgroup.WithContext(context.Background())
+	n, err := task.sendBatches(ctx, g, 1, batches)
 	assert.NoError(t, err)
-	assert.Len(t, jobIDs, 2)
+	assert.Equal(t, 2, n)
+	assert.NoError(t, g.Wait())
 
 	// Each batch broadcasts to all vchannels, so total messages = 2 batches * 2 vchannels.
 	assert.Len(t, stream.msgs, 4)
+}
+
+// A job's wait has to start as it is submitted: the target keeps a finished job's
+// record only briefly, so a wait deferred until every batch is out can find the
+// early jobs already gone.
+func TestSendBatchesWaitsFromSubmission(t *testing.T) {
+	vchannels := newTestVChannels()
+	collBackup := newTestCollBackup(vchannels, nil, nil)
+	stream := &recordingStream{}
+	task := newTestDMLTask(t, collBackup, stream)
+
+	started := make(chan struct{}, 8)
+	task.restfulCli = &countingRestful{onCall: func() {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+	}}
+
+	b := func(ts uint64, dir string) batch {
+		return batch{timestamp: ts, partitionDirs: []partitionDir{{insertLogDir: dir}}, storageVersion: 2}
+	}
+
+	g, ctx := errgroup.WithContext(context.Background())
+
+	// Submit one batch and nothing else. Its wait has to get going on its own.
+	n, err := task.sendBatches(ctx, g, 1, []batch{b(100, "/a")})
+	assert.NoError(t, err)
+	assert.Equal(t, 1, n)
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first job's wait had not started before any further batch was submitted")
+	}
+
+	n, err = task.sendBatches(ctx, g, 1, []batch{b(200, "/b"), b(300, "/c")})
+	assert.NoError(t, err)
+	assert.Equal(t, 2, n)
+	assert.NoError(t, g.Wait())
 }
