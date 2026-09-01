@@ -83,15 +83,48 @@ func (ddlt *collDDLTask) createIndexes(ctx context.Context) error {
 // collection schema instead of broadcasting FieldID 0, which would attach the
 // index to a nonexistent field and leave the import job stuck in IndexBuilding.
 func (ddlt *collDDLTask) resolveIndexField(index *backuppb.IndexInfo) (*backuppb.FieldSchema, error) {
-	for _, field := range ddlt.collBackup.GetSchema().GetFields() {
-		if index.GetFieldId() != 0 && field.GetFieldID() == index.GetFieldId() {
-			return field, nil
+	schema := ddlt.collBackup.GetSchema()
+
+	if id := index.GetFieldId(); id != 0 {
+		for _, field := range schema.GetFields() {
+			if field.GetFieldID() == id {
+				return field, nil
+			}
 		}
-		if index.GetFieldId() == 0 && field.GetName() == index.GetFieldName() {
+		// A struct array's sub-fields are indexed in their own right and carry
+		// their own field ids, but they live under the struct rather than in
+		// the flat field list.
+		for _, structField := range schema.GetStructArrayFields() {
+			for _, field := range structField.GetFields() {
+				if field.GetFieldID() == id {
+					return field, nil
+				}
+			}
+		}
+		return nil, unknownIndexFieldErr(index)
+	}
+
+	name := index.GetFieldName()
+	for _, field := range schema.GetFields() {
+		if field.GetName() == name {
 			return field, nil
 		}
 	}
-	return nil, fmt.Errorf("collection: index %s refers to unknown field (id=%d name=%s)",
+	// DescribeIndex names a sub-field as struct[sub], while the schema holds it
+	// under its bare name, so match both.
+	for _, structField := range schema.GetStructArrayFields() {
+		for _, field := range structField.GetFields() {
+			if field.GetName() == name ||
+				fmt.Sprintf("%s[%s]", structField.GetName(), field.GetName()) == name {
+				return field, nil
+			}
+		}
+	}
+	return nil, unknownIndexFieldErr(index)
+}
+
+func unknownIndexFieldErr(index *backuppb.IndexInfo) error {
+	return fmt.Errorf("collection: index %s refers to unknown field (id=%d name=%s)",
 		index.GetIndexName(), index.GetFieldId(), index.GetFieldName())
 }
 
